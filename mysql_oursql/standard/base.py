@@ -180,7 +180,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
         self.server_version = None
         self.features = DatabaseFeatures(self)
-        self.ops = DatabaseOperations()
+        self.ops = DatabaseOperations(self)
         self.client = DatabaseClient(self)
         self.creation = DatabaseCreation(self)
         self.introspection = DatabaseIntrospection(self)
