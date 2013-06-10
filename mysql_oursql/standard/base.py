@@ -6,6 +6,10 @@ Requires oursql: https://launchpad.net/oursql
 
 import sys
 import re
+from time import time
+from django.utils.log import getLogger
+
+logger = getLogger('django.db.backends')
 
 try:
     import oursql as Database
@@ -40,14 +44,6 @@ server_version_re = re.compile(r'(\d{1,2})\.(\d{1,2})\.(\d{1,2})')
 
 params_re = re.compile(r'%[a-zA-Z]')
 
-# TODO: monkey patch django to support our package in areas such as GIS is not a good solution
-try:
-    from django.conf import settings
-    if settings.DATABASE_ENGINE.startswith('mysql'):
-        settings.DATABASE_ENGINE = 'mysql'
-except ImportError:
-    pass
-
 class CursorWrapper(object):
     """
     A thin wrapper around oursql's normal cursor class so that we can catch
@@ -58,8 +54,9 @@ class CursorWrapper(object):
     """
     codes_for_integrityerror = (1048,)
 
-    def __init__(self, cursor):
+    def __init__(self, cursor, db):
         self.cursor = cursor
+        self.db = db
         
     def _replace_params(self, query):
         return params_re.sub('?', query)
@@ -91,6 +88,8 @@ class CursorWrapper(object):
             raise
 
     def __getattr__(self, attr):
+        if self.db.is_managed():
+            self.db.set_dirty()
         if attr in self.__dict__:
             return self.__dict__[attr]
         else:
@@ -98,6 +97,59 @@ class CursorWrapper(object):
 
     def __iter__(self):
         return iter(self.cursor)
+
+
+class CursorDebugWrapper(CursorWrapper):
+    
+    def execute(self, query, args=(), **kwargs):
+        start = time()
+        sql = self._replace_params(query)
+        try:
+            return self.cursor.execute(sql, args, **kwargs)
+        except Database.IntegrityError, e:
+            raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
+        except Database.OperationalError, e:
+            # Map some error codes to IntegrityError, since they seem to be
+            # misclassified and Django would prefer the more logical place.
+            if e[0] in self.codes_for_integrityerror:
+                raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
+            raise
+        finally:
+            stop = time()
+            duration = stop - start
+            sql = self.db.ops.last_executed_query(self.cursor, query, args)
+            self.db.queries.append({
+                'sql': query,
+                'time': "%.3f" % duration,
+            })
+            logger.debug('(%.3f) %s; args=%s' % (duration, query, args),
+                extra={'duration':duration, 'sql':query, 'params':args}
+            )
+
+    def executemany(self, query, args, **kwargs):
+        start = time()
+        sql = self._replace_params(query)
+        try:
+            return self.cursor.executemany(sql, args, **kwargs)
+        except Database.IntegrityError, e:
+            raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
+        except Database.OperationalError, e:
+            # Map some error codes to IntegrityError, since they seem to be
+            # misclassified and Django would prefer the more logical place.
+            if e[0] in self.codes_for_integrityerror:
+                raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
+            raise
+        finally:
+            stop = time()
+            duration = stop - start
+            self.db.queries.append({
+                'sql': '%s times: %s' % (len(args), query),
+                'time': "%.3f" % duration,
+            })
+            logger.debug('(%.3f) %s; args=%s' % (duration, query, args),
+                extra={'duration':duration, 'sql':query, 'params':args}
+            )
+
 
 class DatabaseFeatures(BaseDatabaseFeatures):
     empty_fetchmany_value = []
@@ -128,7 +180,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
         self.server_version = None
         self.features = DatabaseFeatures(self)
-        self.ops = DatabaseOperations()
+        self.ops = DatabaseOperations(self)
         self.client = DatabaseClient(self)
         self.creation = DatabaseCreation(self)
         self.introspection = DatabaseIntrospection(self)
@@ -176,7 +228,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             # self.connection.encoders[SafeUnicode] = self.connection.encoders[unicode]
             # self.connection.encoders[SafeString] = self.connection.encoders[str]
             connection_created.send(sender=self.__class__)
-        cursor = CursorWrapper(self.connection.cursor())
+        cursor = CursorWrapper(self.connection.cursor(), self)
         return cursor
 
     def _rollback(self):
@@ -194,3 +246,6 @@ class DatabaseWrapper(BaseDatabaseWrapper):
                 raise Exception('Unable to determine MySQL version from version string %r' % self.connection.server_info)
             self.server_version = tuple([int(x) for x in m.groups()])
         return self.server_version
+
+    def make_debug_cursor(self, cursor):
+        return CursorDebugWrapper(cursor, self)
